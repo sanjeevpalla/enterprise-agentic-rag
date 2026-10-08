@@ -1,0 +1,18 @@
+# Secrets
+.env
+
+# Generated data and logs
+logs/
+processed_data/
+qdrant_data/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Downloaded embedding models
+.cache/
+
+# Source documents (large input data; kept out of git)
+DATA/
