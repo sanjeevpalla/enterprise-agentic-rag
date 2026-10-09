@@ -69,9 +69,9 @@ It is built as a [LangGraph](https://langchain-ai.github.io/langgraph/) agent be
 
 ---
 
-## 🏗️ Architecture
+## 🧱 Architecture
 
-### 🗺️ System overview
+### 📐 System overview
 
 Two paths share the Qdrant index: **ingestion** (offline, CLI) writes chunks into it, and the **chat path** (FastAPI + LangGraph agent) searches it. Embeddings, BM25, reranking and guardrail validators run locally on CPU; the LLM is reached through the Portkey gateway (or Gemini directly).
 
@@ -206,7 +206,7 @@ sequenceDiagram
 
 ---
 
-## ⚙️ How it works
+## 🧩 How it works
 
 The graph is drawn under [Agent pipeline](#-agent-pipeline); each step:
 
@@ -303,7 +303,7 @@ uv run python -m app.agent.graph --diagram                    # the graph as Mer
 
 ---
 
-## 🖥️ Using the web UI
+## 💻 Using the web UI
 
 The UI (`ui/index.html`, `ui/static/`) is a single page with no build step.
 
@@ -393,7 +393,7 @@ All settings are read from environment variables or `.env` (`app/config/config.p
 | `EMBEDDING_PROVIDER`, `EMBEDDING_MODEL` | `fastembed`, `nomic-ai/nomic-embed-text-v1.5` | `gemini` embeddings also supported |
 | `CHUNK_SIZE`, `CHUNK_OVERLAP` | `512`, `64` | Tokens |
 
-### 🛡️ Guardrails and grounding
+### 🔒 Guardrails and grounding
 
 | Setting | Default | Notes |
 |---|---|---|
@@ -456,7 +456,7 @@ Show `response.answer` from the `done` event as the final text: the grounding ch
 
 ---
 
-## 🗂️ Project layout
+## 📂 Project layout
 
 ```
 app/
