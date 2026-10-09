@@ -1,38 +1,77 @@
 # Enterprise Agentic RAG
 
+![Python](https://img.shields.io/badge/Python-3.13-3776AB?logo=python&logoColor=white)
+![uv](https://img.shields.io/badge/uv-package%20manager-DE5FE9)
+![LangGraph](https://img.shields.io/badge/LangGraph-agent-1C3C3C?logo=langchain&logoColor=white)
+![LangChain](https://img.shields.io/badge/LangChain-prompts%20%26%20retrievers-1C3C3C?logo=langchain&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-REST%20API-009688?logo=fastapi&logoColor=white)
+![Qdrant](https://img.shields.io/badge/Qdrant-vector%20DB-DC244C)
+![Groq](https://img.shields.io/badge/Groq-gpt--oss--120b-F55036)
+![Portkey](https://img.shields.io/badge/Portkey-AI%20gateway-6E56CF)
+![TypeSafe Jev](https://img.shields.io/badge/TypeSafe%20Jev-routing-2563EB)
+![Gemini](https://img.shields.io/badge/Gemini-optional-8E75B2?logo=googlegemini&logoColor=white)
+![Guardrails AI](https://img.shields.io/badge/Guardrails%20AI-safety-0A7B83)
+![Langfuse](https://img.shields.io/badge/Langfuse-tracing-0A0A0A)
+![SQLite](https://img.shields.io/badge/SQLite-memory-003B57?logo=sqlite&logoColor=white)
+
 A question-answering assistant over your company's documents. It answers technical questions **only from the knowledge base**, cites the passage behind every claim, and lets you open each source with the supporting text highlighted.
 
 It is built as a [LangGraph](https://langchain-ai.github.io/langgraph/) agent behind a FastAPI service, with a ChatGPT-style web UI.
 
-- **Hybrid retrieval**: dense embeddings + BM25 keyword search in Qdrant, fused with RRF, then reranked by a local cross-encoder.
-- **Agentic routing**: a planner decides whether a message needs the knowledge base, and rewrites follow-ups into standalone search queries.
-- **Grounded answers**: numbered citations, a citation check, and a grounding check that removes statements the sources don't support.
-- **Guardrails**: prompt-injection, toxicity, PII and secret checks on the input, the retrieved chunks and the answer.
-- **Conversation memory**: chats persist across restarts; recent chats are listed in the sidebar.
-- **Streaming**: answers stream token by token, with progress updates while the agent searches.
-- **Observability**: optional Langfuse tracing of every step, including token usage.
+- 🔎 **Hybrid retrieval**: dense embeddings + BM25 keyword search in Qdrant, fused with RRF, then reranked by a local cross-encoder.
+- 🧭 **Agentic routing**: a planner decides whether a message needs the knowledge base, and rewrites follow-ups into standalone search queries.
+- 📌 **Grounded answers**: numbered citations, a citation check, and a grounding check that removes statements the sources don't support.
+- 🛡️ **Guardrails**: prompt-injection, toxicity, PII and secret checks on the input, the retrieved chunks and the answer.
+- 💾 **Conversation memory**: chats persist across restarts; recent chats are listed in the sidebar.
+- ⚡ **Streaming**: answers stream token by token, with progress updates while the agent searches.
+- 📈 **Observability**: optional Langfuse tracing of every step, including token usage.
+
+![Knowledge Assistant web UI](docs/assets/web-ui.png)
 
 ---
 
-## Contents
+## 📑 Contents
 
-- [Architecture](#architecture)
-- [How it works](#how-it-works)
-- [Quick start](#quick-start)
-- [Using the web UI](#using-the-web-ui)
-- [Ingesting documents](#ingesting-documents)
-- [Configuration](#configuration)
-- [API](#api)
-- [Project layout](#project-layout)
-- [Citations and grounding](#citations-and-grounding)
-- [Data stored on disk](#data-stored-on-disk)
-- [Troubleshooting](#troubleshooting)
+- [Tech stack](#-tech-stack)
+- [Architecture](#-architecture)
+- [How it works](#-how-it-works)
+- [Quick start](#-quick-start)
+- [Using the web UI](#-using-the-web-ui)
+- [Ingesting documents](#-ingesting-documents)
+- [Configuration](#-configuration)
+- [API](#-api)
+- [Project layout](#-project-layout)
+- [Citations and grounding](#-citations-and-grounding)
+- [Data stored on disk](#-data-stored-on-disk)
+- [Troubleshooting](#-troubleshooting)
 
 ---
 
-## Architecture
+## 🧰 Tech stack
 
-### System overview
+| Layer | Technology | Used for |
+|---|---|---|
+| **Language & tooling** | Python 3.13, [uv](https://docs.astral.sh/uv/) | Runtime, dependency and environment management |
+| **Agent orchestration** | [LangGraph](https://langchain-ai.github.io/langgraph/), [LangChain](https://python.langchain.com/) | The agent graph (nodes, routing, streaming), prompts, retriever and chat-model interfaces |
+| **LLM access** | [Portkey](https://portkey.ai) AI gateway → [Groq](https://groq.com) (`openai/gpt-oss-120b`, fallback `gpt-oss-20b`); [Google Gemini](https://ai.google.dev) as an alternative | Planner, query rewriting, answers, grounding check; gateway handles fallback, retries and response caching |
+| **Routing (optional)** | [TypeSafe Jev](https://docs.typesafe.ai) | Fast typed technical/conversational decision with calibrated confidence |
+| **Vector database** | [Qdrant](https://qdrant.tech) (Cloud/server, or embedded on disk) | Dense + sparse vectors and chunk payloads; hybrid search with RRF fusion |
+| **Embeddings** | [FastEmbed](https://github.com/qdrant/fastembed): `nomic-ai/nomic-embed-text-v1.5` (dense), `Qdrant/bm25` (sparse); Gemini embeddings optional | Semantic and keyword search, run locally on CPU |
+| **Reranking** | FastEmbed cross-encoder `jinaai/jina-reranker-v1-turbo-en` | Reordering search candidates by relevance, locally |
+| **Document parsing** | PyMuPDF4LLM (PDF → Markdown), python-docx, python-pptx, openpyxl, BeautifulSoup, charset-normalizer | Loading PDF, Word, PowerPoint, Excel, HTML and text files |
+| **Chunking** | LangChain text splitters, tiktoken | Heading-aware, token-sized chunks with exact source spans |
+| **Guardrails** | [Guardrails AI](https://www.guardrailsai.com) validators: Detect PII ([Presidio](https://microsoft.github.io/presidio/) + spaCy `en_core_web_lg`), Toxic Language (Detoxify), Secrets Present, Detect Jailbreak (optional); custom injection and citation validators | Input, retrieval and output safety checks, run locally (PyTorch, Transformers) |
+| **API** | [FastAPI](https://fastapi.tiangolo.com), Uvicorn, Pydantic | REST + NDJSON streaming endpoints, request validation, OpenAPI docs |
+| **Configuration** | pydantic-settings | Typed settings from environment variables / `.env` |
+| **Persistence** | SQLite: LangGraph `SqliteSaver` checkpointer, conversation store, ingestion ledger | Conversation memory, recent chats, incremental ingestion |
+| **Web UI** | Plain HTML, CSS and JavaScript (no framework, no build step) | ChatGPT-style chat, streaming, recent chats, source viewer |
+| **Observability** | [Langfuse](https://langfuse.com) (optional), Python logging (text or JSON, rotating files) | Traces of every agent step with token usage; application logs |
+
+---
+
+## 🏗️ Architecture
+
+### 🗺️ System overview
 
 Two paths share the Qdrant index: **ingestion** (offline, CLI) writes chunks into it, and the **chat path** (FastAPI + LangGraph agent) searches it. Embeddings, BM25, reranking and guardrail validators run locally on CPU; the LLM is reached through the Portkey gateway (or Gemini directly).
 
@@ -85,7 +124,7 @@ flowchart TB
     AGENT -.-> OPT
 ```
 
-### Agent pipeline
+### 🤖 Agent pipeline
 
 ```mermaid
 flowchart LR
@@ -101,7 +140,7 @@ flowchart LR
     OG --> A(["answer + sources"])
 ```
 
-### Ingestion pipeline
+### 🔄 Ingestion pipeline
 
 ```mermaid
 flowchart LR
@@ -116,7 +155,7 @@ flowchart LR
     X --> R["record in ledger"]
 ```
 
-### Request flow: one streamed question
+### 📡 Request flow: one streamed question
 
 ```mermaid
 sequenceDiagram
@@ -167,9 +206,9 @@ sequenceDiagram
 
 ---
 
-## How it works
+## ⚙️ How it works
 
-The graph is drawn under [Agent pipeline](#agent-pipeline); each step:
+The graph is drawn under [Agent pipeline](#-agent-pipeline); each step:
 
 | Step | What it does |
 |---|---|
@@ -185,9 +224,9 @@ Each conversation is a LangGraph thread checkpointed to SQLite, so follow-up que
 
 ---
 
-## Quick start
+## 🚀 Quick start
 
-### Prerequisites
+### ✅ Prerequisites
 
 - **Python 3.13+** and [**uv**](https://docs.astral.sh/uv/)
 - **Qdrant**: a server or Qdrant Cloud (`QDRANT_URL`), or nothing at all — without `QDRANT_URL` an embedded on-disk store is used
@@ -234,7 +273,7 @@ QDRANT_COLLECTION=enterprise_agentic_rag
 QDRANT_TIMEOUT=300
 ```
 
-See [Configuration](#configuration) for every setting. `.env` is git-ignored; never commit it.
+See [Configuration](#-configuration) for every setting. `.env` is git-ignored; never commit it.
 
 ### 3. Ingest documents
 
@@ -264,7 +303,7 @@ uv run python -m app.agent.graph --diagram                    # the graph as Mer
 
 ---
 
-## Using the web UI
+## 🖥️ Using the web UI
 
 The UI (`ui/index.html`, `ui/static/`) is a single page with no build step.
 
@@ -284,7 +323,7 @@ There are no user accounts: each browser gets a random id and sees only its own 
 
 ---
 
-## Ingesting documents
+## 📥 Ingesting documents
 
 ```bash
 uv run python -m app.ingestion.ingestion                       # everything under DATA/
@@ -315,11 +354,11 @@ Pipeline: **load → chunk → save JSON (`processed_data/`) → embed → index
 
 ---
 
-## Configuration
+## 🔧 Configuration
 
 All settings are read from environment variables or `.env` (`app/config/config.py`). A key left empty in `.env` (e.g. `RETRIEVAL_TOP_K=`) uses the default.
 
-### LLM
+### 🧠 LLM
 
 | Setting | Default | Notes |
 |---|---|---|
@@ -332,7 +371,7 @@ All settings are read from environment variables or `.env` (`app/config/config.p
 | `PORTKEY_CONFIG` | — | Saved config id (`pc-…`) or inline JSON |
 | `GROQ_SLUG`, `GROQ_SLUG_2` | — | Built-in Groq fallback config (120B → 20B) when `PORTKEY_CONFIG` is empty. Inline configs are rejected by workspaces with *block inline config* enabled: use a saved config instead. |
 
-### Planner and agent
+### 🧭 Planner and agent
 
 | Setting | Default | Notes |
 |---|---|---|
@@ -341,7 +380,7 @@ All settings are read from environment variables or `.env` (`app/config/config.p
 | `AGENT_HISTORY_MESSAGES` | `6` | Earlier messages the agent sees, for follow-ups |
 | `MEMORY_DB_PATH` | `memory_data/memory.sqlite` | Conversation memory and recent chats |
 
-### Retrieval
+### 🔎 Retrieval
 
 | Setting | Default | Notes |
 |---|---|---|
@@ -354,7 +393,7 @@ All settings are read from environment variables or `.env` (`app/config/config.p
 | `EMBEDDING_PROVIDER`, `EMBEDDING_MODEL` | `fastembed`, `nomic-ai/nomic-embed-text-v1.5` | `gemini` embeddings also supported |
 | `CHUNK_SIZE`, `CHUNK_OVERLAP` | `512`, `64` | Tokens |
 
-### Guardrails and grounding
+### 🛡️ Guardrails and grounding
 
 | Setting | Default | Notes |
 |---|---|---|
@@ -366,7 +405,7 @@ All settings are read from environment variables or `.env` (`app/config/config.p
 | `GUARDRAILS_INJECTION_PATTERNS` | `true` | Rule-based injection check |
 | `GUARDRAILS_JAILBREAK_MODEL` | `false` | ML jailbreak detector; off by default (it scored attacks and benign prompts alike on this data) |
 
-### Logging and tracing
+### 📝 Logging and tracing
 
 | Setting | Default | Notes |
 |---|---|---|
@@ -377,7 +416,7 @@ All settings are read from environment variables or `.env` (`app/config/config.p
 
 ---
 
-## API
+## 🔌 API
 
 Interactive docs at `/docs`.
 
@@ -417,7 +456,7 @@ Show `response.answer` from the `done` event as the final text: the grounding ch
 
 ---
 
-## Project layout
+## 🗂️ Project layout
 
 ```
 app/
@@ -460,7 +499,7 @@ uv run python -m app.retrieval.retriever "kubectl rollout undo" --mode dense --n
 
 ---
 
-## Citations and grounding
+## 📚 Citations and grounding
 
 1. Retrieved chunks are numbered `[1]`…`[N]` and given to the responder with their file, location and section.
 2. The responder must use only those passages and cite each statement. Native model citation styles such as `【1】` are normalised to `[1]`.
@@ -473,7 +512,7 @@ Limits: highlighting matches wording, not meaning; the grounding check is an LLM
 
 ---
 
-## Data stored on disk
+## 💽 Data stored on disk
 
 | Path | Contents | Safe to delete? |
 |---|---|---|
@@ -487,7 +526,7 @@ All of these are git-ignored.
 
 ---
 
-## Troubleshooting
+## 🩺 Troubleshooting
 
 | Symptom | Cause and fix |
 |---|---|
