@@ -583,10 +583,12 @@ function showView(viewId) {
     mode.setAttribute("aria-selected", String(active));
   });
   document.querySelectorAll(".view").forEach((view) => { view.hidden = view.id !== viewId; });
-  $("view-title").textContent = viewId === "chat-view" ? "Chat" : "Search";
+  $("view-title").textContent = VIEW_TITLES[viewId];
   if (isMobile()) setSidebar(false);
-  (viewId === "chat-view" ? input : $("search-query")).focus();
+  if (viewId === "eval-view") loadEvaluations();
+  ({ "chat-view": input, "search-view": $("search-query"), "eval-view": $("eval-run") })[viewId].focus();
 }
+const VIEW_TITLES = { "chat-view": "Chat", "search-view": "Search", "eval-view": "Evaluation" };
 document.querySelectorAll(".mode").forEach((mode) => mode.addEventListener("click", () => showView(mode.dataset.view)));
 
 // ---------------------------------------------------------------- sidebar
@@ -654,6 +656,194 @@ $("search-form").addEventListener("submit", async (event) => {
     results.replaceChildren(el("p", { class: "hint", text: `Search failed: ${error.message}` }));
   }
 });
+
+// ---------------------------------------------------------------- evaluation
+// Read-only view of the reports evaluation/run_eval.py writes (GET /evaluations).
+const evalRunSelect = $("eval-run");
+const evalBody = $("eval-body");
+let evalReport = null;
+let evalFilter = "all";  // "all" | "failed" | a category
+let evalRequest = 0;     // ignore responses to superseded loads
+
+const EVAL_COMMAND = "uv run --group eval python -m evaluation.run_eval";
+const pct = (x) => (x == null ? "—" : `${Math.round(x * 100)}%`);
+const score2 = (x) => (x == null ? "—" : x.toFixed(2));
+const metricLabel = (name) => name.replace(" [GEval]", "");
+
+function runLabel(run) {
+  const m = run.id.match(/^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})/);
+  const when = m
+    ? new Date(+m[1], m[2] - 1, +m[3], +m[4], +m[5]).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })
+    : run.id;
+  return `${when} · ${run.passed}/${run.cases} passed`;
+}
+
+async function loadEvaluations() {
+  const request = ++evalRequest;
+  let runs;
+  try {
+    runs = await api("/evaluations");
+  } catch (error) {
+    if (request === evalRequest) evalBody.replaceChildren(el("p", { class: "hint", text: `Couldn't load evaluation runs: ${error.message}` }));
+    return;
+  }
+  if (request !== evalRequest) return;
+  const current = evalRunSelect.value;
+  evalRunSelect.disabled = !runs.length;
+  if (!runs.length) {
+    evalRunSelect.replaceChildren(el("option", { text: "No runs" }));
+    evalReport = null;
+    evalBody.replaceChildren(el("div", { class: "eval-empty" }, [
+      el("p", { text: "No evaluation runs yet. Run the evaluation from the project root:" }),
+      el("pre", { text: EVAL_COMMAND }),
+      el("p", { class: "hint", text: "Reports are read from evaluation/results/ (EVAL_RESULTS_DIR). Reopen this view to refresh." }),
+    ]));
+    return;
+  }
+  evalRunSelect.replaceChildren(...runs.map((r) => el("option", { value: r.id, text: runLabel(r) })));
+  evalRunSelect.value = runs.some((r) => r.id === current) ? current : runs[0].id;
+  if (!evalReport || evalReport.id !== evalRunSelect.value) showEvaluation(evalRunSelect.value);
+}
+evalRunSelect.addEventListener("change", () => showEvaluation(evalRunSelect.value));
+
+async function showEvaluation(runId) {
+  const request = ++evalRequest;
+  evalBody.replaceChildren(el("p", { class: "hint", text: "Loading report…" }));
+  try {
+    const report = await api(`/evaluations/${encodeURIComponent(runId)}`);
+    if (request !== evalRequest) return;
+    evalReport = report;
+    renderEvaluation();
+  } catch (error) {
+    if (request === evalRequest) evalBody.replaceChildren(el("p", { class: "hint", text: `Couldn't load the report: ${error.message}` }));
+  }
+}
+
+// Pass/fail always carries an icon and a word, never color alone.
+function statusTag(ok) {
+  return el("span", { class: `eval-status ${ok ? "pass" : "fail"}`, text: ok ? "✓ Pass" : "✗ Fail" });
+}
+
+function evalTile(label, value, sub) {
+  return el("div", { class: "eval-tile" }, [
+    el("span", { class: "eval-tile-label", text: label }),
+    el("span", { class: "eval-tile-value", text: value, title: value }),
+    sub ? el("span", { class: "eval-tile-sub", text: sub }) : null,
+  ]);
+}
+
+// One row per metric: a bar for the mean score (0–1) with a tick at the pass threshold.
+function metricRows(report) {
+  const thresholds = {};
+  for (const r of report.results) for (const m of r.metrics) thresholds[m.name] ??= m.threshold;
+  return Object.entries(report.summary.metrics).map(([name, m]) => {
+    const threshold = thresholds[name];
+    const passed = Math.round(m.pass_rate * m.n);
+    const errors = m.errors ? ` · ${m.errors} error${m.errors > 1 ? "s" : ""}` : "";
+    const tip = `${metricLabel(name)}: mean ${score2(m.mean)} · threshold ${score2(threshold)} · ${passed}/${m.n} passed${errors}`;
+    const track = el("div", { class: "eval-bar", role: "img", "aria-label": tip });
+    if (m.mean != null) track.append(el("span", { class: "eval-bar-fill", style: `width:${Math.max(m.mean * 100, 1)}%` }));
+    if (threshold != null) track.append(el("span", { class: "eval-bar-threshold", style: `left:${threshold * 100}%` }));
+    return el("div", { class: "eval-metric", title: tip }, [
+      el("span", { class: "eval-metric-name", text: metricLabel(name) }),
+      track,
+      el("span", { class: "eval-num", text: score2(m.mean) }),
+      el("span", { class: "eval-num", text: `${passed}/${m.n}` }),
+      el("span", { class: "eval-errors", text: errors.slice(3) }),
+    ]);
+  });
+}
+
+function caseDetail(r) {
+  const failed = r.metrics.filter((m) => !m.success);
+  const note = r.agent_error ? "agent error" : r.scoring_error ? "not scored" : failed.length ? `failed: ${failed.map((m) => metricLabel(m.name)).join(", ")}` : "";
+  const summary = el("summary", {}, [
+    statusTag(r.success),
+    el("span", { class: "eval-case-id", text: r.id }),
+    el("span", { class: "badge", text: r.category.replace(/_/g, " ") }),
+    el("span", { class: "eval-case-note", text: note, title: note }),
+  ]);
+
+  const block = (label, content) => el("div", { class: "eval-block" }, [el("h4", { text: label }), content]);
+  const unique = (xs) => [...new Set(xs || [])].join(", ");
+  const facts = [
+    ["Route", r.route + (r.expected_route ? ` (expected ${r.expected_route})` : "")],
+    ["Search query", r.search_query],
+    ["Retrieved from", unique(r.retrieved_files)],
+    ["Expected sources", unique(r.expected_sources)],
+    ["Cited", unique(r.cited_files)],
+    ["Latency", r.latency_s != null ? `${r.latency_s}s` : ""],
+  ].filter(([, v]) => v);
+
+  const answer = el("div", { class: "bubble eval-answer" });
+  answer.innerHTML = renderMarkdown(r.answer || "", `eval-${r.id}`, new Set());  // escaped inside renderMarkdown
+
+  const table = el("table", { class: "eval-table" }, [
+    el("thead", {}, el("tr", {}, ["Metric", "Score", "Threshold", "Result", "Judge's reason"].map((h) => el("th", { text: h })))),
+    el("tbody", {}, r.metrics.map((m) => el("tr", {}, [
+      el("td", { text: metricLabel(m.name) }),
+      el("td", { class: "eval-num", text: score2(m.score) }),
+      el("td", { class: "eval-num", text: score2(m.threshold) }),
+      el("td", {}, m.error ? el("span", { class: "eval-status fail", text: "! Error" }) : statusTag(m.success)),
+      el("td", { class: m.error ? "eval-error" : "eval-reason", text: m.error || m.reason || "" }),
+    ]))),
+  ]);
+
+  const body = el("div", { class: "eval-case-body" }, [
+    r.history && r.history.length ? block("Earlier turns", el("ol", { class: "eval-history" }, r.history.map((h) => el("li", { text: h })))) : null,
+    block("Question", el("p", { text: r.input })),
+    r.agent_error ? block("Agent error", el("p", { class: "eval-error", text: r.agent_error })) : block("Answer", answer),
+    r.expected_output ? block("Reference answer", el("p", { text: r.expected_output })) : null,
+    facts.length ? el("dl", { class: "eval-facts" }, facts.map(([k, v]) => el("div", {}, [el("dt", { text: k }), el("dd", { text: v })]))) : null,
+    r.scoring_error
+      ? block("Metrics", el("p", { class: "eval-error", text: r.scoring_error }))
+      : block("Metrics", el("div", { class: "eval-table-wrap" }, table)),
+  ]);
+  return el("details", { class: "panel eval-case" }, [summary, body]);
+}
+
+function renderEvaluation() {
+  const report = evalReport;
+  const s = report.summary;
+  const results = report.results;
+  const categories = [...new Set(results.map((r) => r.category))];
+  const failedCount = results.filter((r) => !r.success).length;
+  if (!["all", "failed", ...categories].includes(evalFilter)) evalFilter = "all";
+
+  const filters = [
+    ["all", `All · ${results.length}`],
+    ["failed", `Failed · ${failedCount}`],
+    ...categories.map((c) => [c, `${c.replace(/_/g, " ")} · ${results.filter((r) => r.category === c).length}`]),
+  ];
+  const filterBar = el("div", { class: "eval-filters", role: "radiogroup", "aria-label": "Show cases" }, filters.map(([value, label]) => {
+    const button = el("button", { type: "button", role: "radio", class: "eval-filter", "aria-checked": String(value === evalFilter), text: label });
+    button.addEventListener("click", () => { evalFilter = value; renderEvaluation(); });
+    return button;
+  }));
+  const shown = results.filter((r) => evalFilter === "all" || (evalFilter === "failed" ? !r.success : r.category === evalFilter));
+
+  evalBody.replaceChildren(
+    el("div", { class: "eval-tiles" }, [
+      evalTile("Pass rate", pct(s.pass_rate), `${s.passed} of ${s.cases} cases passed`),
+      evalTile("Failed cases", String(s.cases - s.passed), failedCount ? "filter “Failed” below" : "every case passed"),
+      evalTile("Median latency", s.median_latency_s != null ? `${s.median_latency_s}s` : "—", "agent, per question"),
+      evalTile("Judge", report.judge || "—", report.threshold != null ? `LLM metric threshold ${report.threshold}` : ""),
+    ]),
+    el("section", { class: "eval-section" }, [
+      el("h3", { text: "Metrics" }),
+      el("div", { class: "eval-metric eval-metric-head", "aria-hidden": "true" }, [
+        el("span", { text: "Metric" }), el("span", { text: "Mean score (tick = pass threshold)" }),
+        el("span", { class: "eval-num", text: "Mean" }), el("span", { class: "eval-num", text: "Passed" }), el("span"),
+      ]),
+      ...metricRows(report),
+    ]),
+    el("section", { class: "eval-section" }, [
+      el("h3", { text: "Cases" }),
+      filterBar,
+      shown.length ? el("div", { class: "eval-cases" }, shown.map(caseDetail)) : el("p", { class: "hint", text: "No cases match this filter." }),
+    ]),
+  );
+}
 
 // ---------------------------------------------------------------- status
 async function loadStatus() {

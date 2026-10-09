@@ -6,6 +6,8 @@ logs/
 processed_data/
 qdrant_data/
 memory_data/
+evaluation/results/
+.deepeval/
 
 # Python
 __pycache__/

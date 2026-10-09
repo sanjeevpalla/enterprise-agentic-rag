@@ -41,6 +41,7 @@ It is built as a [LangGraph](https://langchain-ai.github.io/langgraph/) agent be
 - [Configuration](#-configuration)
 - [API](#-api)
 - [Project layout](#-project-layout)
+- [Evaluation](#-evaluation)
 - [Citations and grounding](#-citations-and-grounding)
 - [Data stored on disk](#-data-stored-on-disk)
 - [Troubleshooting](#-troubleshooting)
@@ -286,10 +287,10 @@ uv run python -m app.ingestion.ingestion --data-dir DATA/true_data
 ### 4. Run
 
 ```bash
-uv run uvicorn app.main:app --reload
+uv run uvicorn app.main:app --port 9000 --reload
 ```
 
-Open **http://127.0.0.1:8000/** for the UI and **http://127.0.0.1:8000/docs** for the interactive API docs.
+Open **http://127.0.0.1:9000/** for the UI and **http://127.0.0.1:9000/docs** for the interactive API docs.
 
 > Use `127.0.0.1`, not `0.0.0.0`: with `--host 0.0.0.0` Uvicorn prints the bind address, which browsers can't open. From another machine, use this machine's IP or hostname.
 
@@ -432,13 +433,15 @@ Interactive docs at `/docs`.
 | `POST` | `/search` | Retrieval only (hybrid search + rerank), for debugging |
 | `GET` | `/health` | Liveness and configuration summary (including the model actually used) |
 | `GET` | `/graph` | The agent graph as Mermaid |
+| `GET` | `/evaluations` | Evaluation runs (reports from `evaluation/run_eval.py`), newest first |
+| `GET` | `/evaluations/{run_id}` | One evaluation run's full report |
 
 Conversation endpoints and `/chat` use the `X-Client-Id` header to keep each client's chats separate (the UI sends a random id per browser). This is not authentication.
 
 **Ask a question**
 
 ```bash
-curl -s http://127.0.0.1:8000/chat -H "Content-Type: application/json" \
+curl -s http://127.0.0.1:9000/chat -H "Content-Type: application/json" \
   -d '{"question": "How do I limit how many times a Kubernetes job retries?"}'
 ```
 
@@ -486,6 +489,7 @@ app/
 ui/
 ├── index.html              Web UI
 └── static/                 app.js, styles.css
+evaluation/                 deepeval evaluation: golden dataset, metrics, runner (see evaluation/README.md)
 DATA/                       Source documents (git-ignored, except one sample per file type)
 ```
 
@@ -496,6 +500,20 @@ uv run python -m app.retrieval.retriever "How do I autoscale pods?"
 uv run python -m app.retrieval.retriever "cron schedule syntax" -k 3 --source-type true_data
 uv run python -m app.retrieval.retriever "kubectl rollout undo" --mode dense --no-rerank
 ```
+
+---
+
+## 🧪 Evaluation
+
+`evaluation/` (outside the app) evaluates the agent with [deepeval](https://deepeval.com) on a golden dataset over `DATA/true_data`. It scores retrieval (contextual precision, recall, relevancy, source hit), answers (relevancy, faithfulness, correctness), abstention on out-of-scope questions, routing and guardrail blocking.
+
+```bash
+uv sync --group eval
+uv run --group eval python -m evaluation.run_eval            # writes evaluation/results/<timestamp>/
+uv run --group eval --env-file evaluation/deepeval.env deepeval test run evaluation/test_rag.py  # same, as pytest tests
+```
+
+Results appear in the web UI under **Evaluation** in the sidebar: pass rate, a score bar per metric against its threshold, and every case with its answer, reference answer, retrieved sources and the judge's reasons (read-only, from `GET /evaluations`). The judge uses the app's own LLM settings by default. See [evaluation/README.md](evaluation/README.md) for the metrics, the judge and the dataset format.
 
 ---
 
@@ -521,6 +539,7 @@ Limits: highlighting matches wording, not meaning; the grounding check is an LLM
 | `qdrant_data/` | Embedded Qdrant store (when `QDRANT_URL` is not set) | Yes: re-ingest afterwards |
 | `.cache/fastembed/` | Downloaded embedding and reranker models | Yes: downloaded again on next start |
 | `logs/` | Application logs | Yes |
+| `evaluation/results/` | Evaluation runs (agent outputs, deepeval reports) shown in the UI's Evaluation view | Yes: removes them from the Evaluation view |
 
 All of these are git-ignored.
 
@@ -530,7 +549,7 @@ All of these are git-ignored.
 
 | Symptom | Cause and fix |
 |---|---|
-| UI shows unstyled HTML | Open the page through the server (`http://127.0.0.1:8000/`), not as a file, and hard-refresh (Ctrl+F5) after moving files. |
+| UI shows unstyled HTML | Open the page through the server (`http://127.0.0.1:9000/`), not as a file, and hard-refresh (Ctrl+F5) after moving files. |
 | Sidebar says *API unavailable* | The page was opened from disk, or the server isn't running. |
 | *Couldn't reach the language model because of a configuration problem* | See the server log. With Portkey: `Invalid API Key` usually means the wrong `PORTKEY_BASE_URL`; `inline_config_blocked` means the workspace requires a saved config (`PORTKEY_CONFIG=pc-…`); `model_not_found` means the provider retired the model in your config. |
 | *Language model is temporarily unavailable* | Rate limit or overload (429/503) after retries; try again shortly. |
