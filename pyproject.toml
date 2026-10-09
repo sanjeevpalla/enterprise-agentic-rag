@@ -1,7 +1,7 @@
 [project]
 name = "enterprise-agentic-rag"
 version = "0.1.0"
-description = "Add your description here"
+description = "Agentic RAG assistant over enterprise documents: hybrid retrieval, cited and grounded answers, guardrails, web UI"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
