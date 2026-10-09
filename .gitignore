@@ -6,6 +6,8 @@ logs/
 processed_data/
 qdrant_data/
 memory_data/
+evaluation/results/
+.deepeval/
 
 # Python
 __pycache__/
@@ -23,3 +25,6 @@ DATA/**
 !DATA/true_data/architecture.pptx
 !DATA/true_data/job_management.html
 !DATA/true_data/parallel_work_queue.txt
+
+# evaluation results (kept out of git)
+evaluation/results/**

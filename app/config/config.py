@@ -46,6 +46,10 @@ class Settings(BaseSettings):
     # recent-chats list, in one SQLite file, so conversations survive restarts.
     memory_db_path: Path = Path("memory_data/memory.sqlite")
 
+    # Evaluation runs (evaluation/run_eval.py writes <dir>/<timestamp>/report.json), shown
+    # read-only in the web UI's Evaluation view.
+    eval_results_dir: Path = Path("evaluation/results")
+
     # Chunking
     chunk_size: int = 512
     chunk_overlap: int = 64

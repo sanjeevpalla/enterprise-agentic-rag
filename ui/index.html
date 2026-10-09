@@ -45,6 +45,10 @@
           <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg>
           <span>Search knowledge base</span>
         </button>
+        <button class="mode" role="tab" aria-selected="false" aria-controls="eval-view" id="tab-eval" data-view="eval-view" title="Evaluation results (deepeval)">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>
+          <span>Evaluation</span>
+        </button>
       </nav>
 
       <div class="sidebar-scroll">
@@ -170,6 +174,25 @@
               <button class="button primary" type="submit">Search</button>
             </form>
             <div id="search-results" class="results" aria-live="polite"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Evaluation (read-only: reports written by evaluation/run_eval.py) -->
+      <section class="view" id="eval-view" role="tabpanel" aria-labelledby="tab-eval" hidden>
+        <div class="search-scroll">
+          <div class="search-inner eval-inner">
+            <div class="eval-head">
+              <div>
+                <h2>Evaluation</h2>
+                <p class="hint">deepeval scores of the agent on the golden dataset. Each run is a report from <code>evaluation/run_eval.py</code>.</p>
+              </div>
+              <label class="field eval-run" for="eval-run">
+                <span>Run</span>
+                <select id="eval-run" disabled><option>Loading…</option></select>
+              </label>
+            </div>
+            <div id="eval-body" aria-live="polite"></div>
           </div>
         </div>
       </section>

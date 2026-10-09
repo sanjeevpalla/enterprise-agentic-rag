@@ -2,11 +2,11 @@
 
 Run from the project root:
 
-    uv run uvicorn app.main:app --reload            # development
-    uv run uvicorn app.main:app --host 0.0.0.0      # serve on the network
+    uv run uvicorn app.main:app --port 9000 --reload            # development
+    uv run uvicorn app.main:app --port 9000 --host 0.0.0.0      # serve on the network
 
-Then open http://127.0.0.1:8000/ for the web UI (API docs at /docs). With --host 0.0.0.0, Uvicorn prints
-"http://0.0.0.0:8000": that's the bind address (all interfaces), not a URL a browser can open;
+Then open http://127.0.0.1:9000/ for the web UI (API docs at /docs). With --host 0.0.0.0, Uvicorn prints
+"http://0.0.0.0:9000": that's the bind address (all interfaces), not a URL a browser can open;
 use 127.0.0.1 on this machine, or the machine's IP/hostname from elsewhere.
 
 Endpoints (interactive docs at /docs):
@@ -20,6 +20,8 @@ Endpoints (interactive docs at /docs):
     POST /search        retrieval only (hybrid search + rerank), for debugging retrieval
     GET  /health        liveness and configuration summary
     GET  /graph         the agent graph as Mermaid
+    GET  /evaluations            evaluation runs (evaluation/run_eval.py reports), newest first
+    GET  /evaluations/{run_id}   one run's full report
 """
 
 from __future__ import annotations
@@ -160,9 +162,27 @@ class SearchResponse(BaseModel):
     duration_seconds: float
 
 
+class EvaluationRun(BaseModel):
+    id: str = Field(description="Run folder name: the run's start time, YYYYMMDD-HHMMSS")
+    created_at: float = Field(description="Unix time the report was written")
+    judge: str | None = None
+    cases: int
+    passed: int
+    pass_rate: float | None = None
+
+
 # ---------------------------------------------------------------------------- app
 
 CLIENT_HEADER = "X-Client-Id"
+_EVAL_RUN_ID = re.compile(r"\d{8}-\d{6}")
+
+
+def evaluation_reports(results_dir: Path) -> list[Path]:
+    """report.json of every evaluation run under ``results_dir``, newest first."""
+    if not results_dir.is_dir():
+        return []
+    reports = [p / "report.json" for p in results_dir.iterdir() if _EVAL_RUN_ID.fullmatch(p.name)]
+    return sorted((p for p in reports if p.is_file()), key=lambda p: p.parent.name, reverse=True)
 _CLIENT_ID = re.compile(r"[A-Za-z0-9_-]{8,64}")
 
 
@@ -423,6 +443,35 @@ def create_app(
     @app.get("/graph", tags=["agent"])
     def graph() -> dict[str, str]:
         return {"mermaid": diagram()}
+
+    # Evaluation reports written by evaluation/run_eval.py; read-only, nothing here runs an evaluation.
+    @app.get("/evaluations", response_model=list[EvaluationRun], tags=["evaluation"])
+    def list_evaluations() -> list[EvaluationRun]:
+        runs = []
+        for path in evaluation_reports(settings.eval_results_dir):
+            try:
+                report = json.loads(path.read_text(encoding="utf-8"))
+                summary = report["summary"]
+                runs.append(EvaluationRun(
+                    id=path.parent.name, created_at=path.stat().st_mtime, judge=report.get("judge"),
+                    cases=summary["cases"], passed=summary["passed"], pass_rate=summary.get("pass_rate"),
+                ))
+            except (OSError, ValueError, KeyError, TypeError):
+                logger.warning("Skipping unreadable evaluation report %s", path)
+        return runs
+
+    @app.get("/evaluations/{run_id}", tags=["evaluation"])
+    def get_evaluation(run_id: str) -> dict[str, Any]:
+        if not _EVAL_RUN_ID.fullmatch(run_id):  # also keeps the path inside eval_results_dir
+            raise HTTPException(status_code=404, detail="Evaluation run not found")
+        path = settings.eval_results_dir / run_id / "report.json"
+        try:
+            report = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail="Evaluation run not found") from None
+        except (OSError, ValueError):
+            raise HTTPException(status_code=500, detail="The evaluation report could not be read") from None
+        return {"id": run_id, "created_at": path.stat().st_mtime, **report}
 
     # Web UI: a single page (no build step) that calls the API above. ui/index.html loads its
     # assets from ui/static/ by relative path (static/app.js), so it also works opened from disk.
