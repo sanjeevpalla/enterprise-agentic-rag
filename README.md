@@ -486,7 +486,7 @@ app/
 ui/
 ├── index.html              Web UI
 └── static/                 app.js, styles.css
-DATA/                       Source documents (git-ignored)
+DATA/                       Source documents (git-ignored, except one sample per file type)
 ```
 
 Retrieval can be tried on its own:

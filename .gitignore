@@ -15,5 +15,11 @@ __pycache__/
 # Downloaded embedding models
 .cache/
 
-# Source documents (large input data; kept out of git)
-DATA/
+# Source documents (large input data; kept out of git) except one sample per file type
+DATA/**
+!DATA/**/
+!DATA/noisy_data/A Framework for Building Extensible C++ Class Libraries - 1993.pdf
+!DATA/true_data/monitor_job.docx
+!DATA/true_data/architecture.pptx
+!DATA/true_data/job_management.html
+!DATA/true_data/parallel_work_queue.txt
