@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any, ContextManager
 
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -50,7 +50,7 @@ from app.retrieval.passage import highlight_ranges, source_passage
 
 logger = logging.getLogger(__name__)
 
-UI_DIR = Path(__file__).resolve().parent.parent / "ui" / "static"  # <project root>/ui/static
+UI_DIR = Path(__file__).resolve().parent.parent / "ui"  # <project root>/ui: index.html + static/
 
 
 # ---------------------------------------------------------------------------- schemas
@@ -424,11 +424,13 @@ def create_app(
     def graph() -> dict[str, str]:
         return {"mermaid": diagram()}
 
-    # Web UI: a single static page (no build step) that calls /chat, /search and /health.
-    # Mounted at the root, last, so the API routes above take precedence; index.html references
-    # its assets relatively (styles.css, app.js). /static/... stays available for old links.
-    app.mount("/static", StaticFiles(directory=UI_DIR), name="static")
-    app.mount("/", StaticFiles(directory=UI_DIR, html=True), name="ui")
+    # Web UI: a single page (no build step) that calls the API above. ui/index.html loads its
+    # assets from ui/static/ by relative path (static/app.js), so it also works opened from disk.
+    app.mount("/static", StaticFiles(directory=UI_DIR / "static"), name="static")
+
+    @app.get("/", include_in_schema=False)
+    def ui() -> FileResponse:
+        return FileResponse(UI_DIR / "index.html")
 
     return app
 
