@@ -1,6 +1,5 @@
 # Enterprise Agentic RAG — Scaling Plan
 
-As of 2026-10-09.
 
 ## Summary
 
