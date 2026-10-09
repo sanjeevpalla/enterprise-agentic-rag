@@ -1,0 +1,27 @@
+# Secrets: pass configuration at run time (--env-file .env), never bake it into the image
+.env
+evaluation/deepeval.env
+
+# Local environment, caches and generated data
+.venv/
+.cache/
+.deepeval/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+logs/
+memory_data/
+processed_data/
+qdrant_data/
+evaluation/results/
+
+# Source documents: mount them when ingesting
+DATA/
+
+# Not needed in the image
+.git/
+.gitignore
+docs/
+README.md
+Dockerfile
+.dockerignore

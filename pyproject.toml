@@ -31,12 +31,22 @@ dependencies = [
     "python-pptx>=1.0",
     "qdrant-client>=1.12",
     "tiktoken>=0.7",
+    # Needed by the toxicity/jailbreak guardrails; listed only to pin the CPU build (see sources).
+    "torch>=2.14",
     "typesafe-sdk>=0.7.2",
     "uvicorn>=0.54.0",
 ]
 
 [tool.uv.sources]
 en-core-web-lg = { url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_lg-3.8.0/en_core_web_lg-3.8.0-py3-none-any.whl" }
+# CPU-only PyTorch everywhere: all models run on CPU, and the default Linux build pulls
+# ~4 GB of unused CUDA libraries into the Docker image.
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [dependency-groups]
 eval = [
