@@ -18,13 +18,16 @@ from pydantic import BaseModel, Field
 
 from typesafe_sdk import Choice, TypeSafeClient, TypeSafeError
 
-from app.agent.llm import with_retry
+from app.agent.llm import RETRYABLE_ERRORS, with_retry
 from app.agent.prompts import (
     BLOCKED_MESSAGE_PLACEHOLDER,
+    GROUNDING_EMPTY_ANSWER,
+    GROUNDING_SYSTEM,
     INPUT_BLOCKED_ANSWER,
     OUTPUT_BLOCKED_ANSWER,
     JEV_ROUTE_CRITERIA,
     JEV_ROUTE_INSTRUCTIONS,
+    LLM_ERROR_ANSWER,
     LLM_UNAVAILABLE_ANSWER,
     NO_RESULTS_ANSWER,
     PLANNER_SYSTEM,
@@ -52,6 +55,31 @@ def _recent_history(state: AgentState, limit: int) -> list[AnyMessage]:
     return messages[:-1][-limit:] if limit > 0 else []
 
 
+# Messages that are only a greeting, thanks, farewell or acknowledgement: routed as
+# conversational without asking a model (faster, and works while the planner model is down).
+# Anything with more content ("hi, how do I scale pods?") doesn't match and goes to the planner.
+_SMALL_TALK = re.compile(
+    r"(?:hi|hii+|hello+|hey+|hiya|yo|greetings|howdy|good (?:morning|afternoon|evening|day)"
+    r"|thanks?|thank you|thx|ty|cheers|much appreciated|appreciate it"
+    r"|bye|goodbye|see you|see ya|later|good night"
+    r"|ok|okay|k|cool|great|nice|awesome|perfect|got it|sounds good"
+    r"|how are you|how are you doing|how's it going|what's up|sup"
+    r"|who are you|what are you|what can you do)"
+    r"(?: (?:there|all|everyone|team|bot|assistant|again|so much|a lot|very much|buddy|mate))*"
+)
+
+
+def _is_small_talk(message: str) -> bool:
+    """True if the message is nothing but small talk (case, punctuation and emoji ignored)."""
+    text = re.sub(r"[^\w\s']", " ", message.lower().replace("’", "'"))
+    return bool(_SMALL_TALK.fullmatch(" ".join(text.split())))
+
+
+def _small_talk_plan() -> dict[str, Any]:
+    return {"route": "conversational", "plan_reason": "small talk (rule)", "search_query": "",
+            "documents": [], "sources": []}
+
+
 class QueryPlan(BaseModel):
     """The planner's decision for one user message."""
 
@@ -66,14 +94,17 @@ class PlannerNode:
     def __init__(
         self, llm: BaseChatModel, history_messages: int = 6, structured_method: str | None = None
     ) -> None:
-        # structured_method="function_calling" uses tool calling instead of a JSON-schema
-        # response format, which not every model behind a gateway supports.
+        # structured_method picks how the model returns the plan ("json_schema" or
+        # "function_calling"); support varies by model behind a gateway. None = LangChain's default.
         kwargs = {"method": structured_method} if structured_method else {}
         self.planner = with_retry(llm.with_structured_output(QueryPlan, **kwargs))
         self.history_messages = history_messages
 
     def __call__(self, state: AgentState) -> dict[str, Any]:
         question = _latest_user_message(state)
+        if _is_small_talk(question):
+            logger.info("Planner: conversational (small talk rule)", extra={"route": "conversational"})
+            return _small_talk_plan()
         messages = [
             SystemMessage(PLANNER_SYSTEM),
             *_recent_history(state, self.history_messages),
@@ -127,7 +158,10 @@ class JevPlannerNode:
 
     def __call__(self, state: AgentState) -> dict[str, Any]:
         question = _latest_user_message(state)
-        decision_state = _conversation_state(_recent_history(state, self.history_messages), question)
+        if _is_small_talk(question):
+            logger.info("Planner (Jev): conversational (small talk rule)", extra={"route": "conversational"})
+            return _small_talk_plan()
+        decision_state =_conversation_state(_recent_history(state, self.history_messages), question)
         with self.tracer.observation(
             "jev-route", as_type="tool", input={"state": decision_state, "criteria": list(JEV_ROUTE_CRITERIA)}
         ) as span:
@@ -205,6 +239,15 @@ class RetrieverNode:
         return {"documents": documents, "search_query": query}
 
 
+# Some models (e.g. gpt-oss) cite in their native style, 【1】 or 【1†L3-L5】: the rest of the
+# pipeline (source filtering, CitationCheck, grounding, the UI) expects [1].
+_NATIVE_CITATION = re.compile(r"【\s*(\d{1,2})(?:\s*†[^】]*)?\s*】")
+
+
+def _normalize_citations(text: str) -> str:
+    return _NATIVE_CITATION.sub(lambda m: f"[{m.group(1)}]", text)
+
+
 class ResponderNode:
     """Writes the final answer: grounded with citations for technical queries, a direct reply otherwise."""
 
@@ -212,21 +255,28 @@ class ResponderNode:
         self.llm = with_retry(llm)
         self.history_messages = history_messages
 
-    def _generate(self, messages: list[AnyMessage]) -> str | None:
-        """LLM reply text, or None if the model is still unavailable after retries."""
+    def _generate(self, messages: list[AnyMessage]) -> tuple[str | None, str]:
+        """(LLM reply text, None) or (None, fallback answer) if the call failed: a "try again"
+        answer for transient errors (still failing after retries), an admin-facing one otherwise
+        (invalid API key, unknown model, ...)."""
         try:
-            return self.llm.invoke(messages).text
+            return _normalize_citations(self.llm.invoke(messages).text), ""
+        except RETRYABLE_ERRORS:
+            logger.exception("Responder LLM call failed (rate limit/overload)")
+            return None, LLM_UNAVAILABLE_ANSWER
         except Exception:
             logger.exception("Responder LLM call failed")
-            return None
+            return None, LLM_ERROR_ANSWER
 
     def __call__(self, state: AgentState) -> dict[str, Any]:
         question = _latest_user_message(state)
         history = _recent_history(state, self.history_messages)
 
         if state.get("route") == "conversational":
-            reply = self._generate([SystemMessage(RESPONDER_CONVERSATIONAL_SYSTEM), *history, HumanMessage(question)])
-            return {"messages": [AIMessage(reply or LLM_UNAVAILABLE_ANSWER)], "sources": []}
+            reply, fallback = self._generate(
+                [SystemMessage(RESPONDER_CONVERSATIONAL_SYSTEM), *history, HumanMessage(question)]
+            )
+            return {"messages": [AIMessage(reply or fallback)], "sources": []}
 
         documents = state.get("documents") or []
         if not documents:
@@ -235,9 +285,9 @@ class ResponderNode:
 
         sources = [_source_entry(number, doc) for number, doc in enumerate(documents, start=1)]
         system = RESPONDER_TECHNICAL_SYSTEM.format(context=_format_context(documents, sources))
-        answer = self._generate([SystemMessage(system), *history, HumanMessage(question)])
+        answer, fallback = self._generate([SystemMessage(system), *history, HumanMessage(question)])
         if answer is None:
-            return {"messages": [AIMessage(LLM_UNAVAILABLE_ANSWER)], "sources": []}
+            return {"messages": [AIMessage(fallback)], "sources": []}
         cited = {int(n) for n in re.findall(r"\[(\d+)\]", answer)}
         return {
             "messages": [AIMessage(answer)],
@@ -288,6 +338,99 @@ class RetrievalGuardNode:
         if new_events:
             logger.info("Retrieval guardrails: %s", [(e["validator"], e["action"]) for e in new_events])
         return {"documents": documents, "guardrail_events": [*state.get("guardrail_events", []), *new_events]}
+
+
+class UnsupportedClaim(BaseModel):
+    quote: str = Field(description="The unsupported sentence or bullet item, copied exactly from the answer")
+    reason: str = Field(description="Why the passages don't support it, in a few words")
+
+
+class GroundingReport(BaseModel):
+    unsupported: list[UnsupportedClaim] = Field(description="Empty if every statement is supported")
+
+
+_FENCE_BLOCK = re.compile(r"```.*?(?:```|\Z)", re.S)
+_LIST_MARKER = re.compile(r"^\s*(?:[-*•]|\d+[.)])?\s*$")
+
+
+def _remove_claims(answer: str, quotes: list[str]) -> tuple[str, list[str]]:
+    """Remove each quoted sentence from the answer (never inside code blocks); drop lines
+    left empty. Returns the new text and the quotes actually removed."""
+    removed: list[str] = []
+    for quote in dict.fromkeys(q.strip() for q in quotes if q and q.strip()):
+        at = answer.find(quote)
+        if at < 0:
+            continue  # not verbatim: leave the answer alone rather than guess
+        fences = [m.span() for m in _FENCE_BLOCK.finditer(answer)]
+        if any(start <= at < end for start, end in fences):
+            continue
+        end = at + len(quote)
+        while end < len(answer) and answer[end] in " \t":
+            end += 1
+        answer = answer[:at] + answer[end:]
+        removed.append(quote)
+    lines = [line for line in answer.split("\n") if not (line.strip() and _LIST_MARKER.match(line))]
+    text = re.sub(r"\n{3,}", "\n\n", "\n".join(line.rstrip() for line in lines)).strip()
+    return text, removed
+
+
+class GroundingCheckNode:
+    """Removes statements a technical answer makes that its source passages don't support.
+
+    The prompt tells the responder to use only the passages, but models still add facts they
+    know (e.g. a default value the documents never mention), and CitationCheck only verifies
+    that cited numbers exist. A second, focused LLM pass lists the unsupported sentences; they
+    are cut from the answer and reported as guardrail events. Code blocks are left as written.
+    If the check itself fails, the answer is kept unchanged.
+    """
+
+    def __init__(self, llm: BaseChatModel, structured_method: str | None = None) -> None:
+        kwargs = {"method": structured_method} if structured_method else {}
+        self.checker = with_retry(llm.with_structured_output(GroundingReport, **kwargs))
+
+    def __call__(self, state: AgentState) -> dict[str, Any]:
+        documents = state.get("documents") or []
+        last = state["messages"][-1] if state.get("messages") else None
+        if state.get("route") != "technical" or not documents or not isinstance(last, AIMessage):
+            return {}
+        answer = last.text
+        if answer in (NO_RESULTS_ANSWER, LLM_UNAVAILABLE_ANSWER, LLM_ERROR_ANSWER):
+            return {}
+
+        sources = [_source_entry(number, doc) for number, doc in enumerate(documents, start=1)]
+        messages = [
+            SystemMessage(GROUNDING_SYSTEM.format(context=_format_context(documents, sources))),
+            HumanMessage(f"Answer to verify:\n\n{answer}"),
+        ]
+        try:
+            report: GroundingReport = self.checker.invoke(messages)
+        except Exception:
+            logger.exception("Grounding check failed; keeping the answer unchanged")
+            return {}
+
+        reasons = {c.quote.strip(): c.reason for c in report.unsupported}
+        text, removed = _remove_claims(answer, list(reasons))
+        if not removed:
+            if report.unsupported:
+                logger.info("Grounding check: %d claim(s) flagged but not found verbatim", len(report.unsupported))
+            return {}
+
+        logger.warning("Grounding check removed %d unsupported statement(s)", len(removed))
+        events = [
+            {"stage": "output", "validator": "Grounding", "action": "dropped", "detail": f"{q} — {reasons[q]}"}
+            for q in removed
+        ]
+        if not re.search(r"\w", _FENCE_BLOCK.sub("", text)):  # nothing but code (or nothing) left
+            text, kept_sources = GROUNDING_EMPTY_ANSWER, []
+        else:
+            cited = {int(n) for n in re.findall(r"\[(\d+)\]", text)}
+            current = state.get("sources") or []
+            kept_sources = [s for s in current if s["number"] in cited] or current
+        return {
+            "messages": [AIMessage(text, id=last.id)],
+            "sources": kept_sources,
+            "guardrail_events": [*state.get("guardrail_events", []), *events],
+        }
 
 
 class OutputGuardNode:

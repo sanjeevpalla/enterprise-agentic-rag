@@ -9,6 +9,10 @@ With guardrails (GUARDRAILS_ENABLED, default on):
                          └─ ok → planner ─┬─ technical → retriever → retrieval_guard ─┐
                                           └─ conversational ──────────────────────────┴→ responder → output_guard → END
 
+With GROUNDING_CHECK_ENABLED (default on), a grounding node runs right after the responder
+(responder → grounding → output_guard / END): it removes statements of technical answers that
+the source passages don't support.
+
 The planner is TypeSafe's Jev decision model by default (PLANNER_PROVIDER=jev), or the
 Gemini planner (PLANNER_PROVIDER=llm).
 
@@ -24,11 +28,12 @@ from __future__ import annotations
 import argparse
 import logging
 import uuid
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessageChunk, HumanMessage
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
@@ -39,6 +44,7 @@ from typesafe_sdk import TypeSafeClient
 from app.agent.jev import build_typesafe_client
 from app.agent.llm import build_chat_model
 from app.agent.nodes import (
+    GroundingCheckNode,
     InputGuardNode,
     JevPlannerNode,
     OutputGuardNode,
@@ -51,6 +57,7 @@ from app.agent.nodes import (
 from app.agent.state import AgentState
 from app.config import Settings, get_settings
 from app.logging import setup_logging
+from app.memory import build_checkpointer
 from app.observability import Tracer
 from app.retrieval import EnterpriseRetriever, build_retriever
 
@@ -76,9 +83,11 @@ def build_graph(
     planner: Any | None = None,
     structured_method: str | None = None,
     guardrails: Any | None = None,
+    grounding: bool = True,
 ) -> CompiledStateGraph:
     """``planner`` overrides the planner node (e.g. JevPlannerNode); default is the LLM planner.
-    ``guardrails`` (app.guardrails.RAGGuardrails) adds the input/retrieval/output guard nodes."""
+    ``guardrails`` (app.guardrails.RAGGuardrails) adds the input/retrieval/output guard nodes.
+    ``grounding`` adds the grounding check after the responder."""
     guards = (
         (InputGuardNode(guardrails.input), RetrievalGuardNode(guardrails.retrieval), OutputGuardNode(guardrails.output))
         if guardrails is not None
@@ -90,6 +99,7 @@ def build_graph(
         ResponderNode(llm, history_messages),
         checkpointer or InMemorySaver(),
         guards,
+        GroundingCheckNode(llm, structured_method) if grounding else None,
     )
 
 
@@ -99,6 +109,7 @@ def _assemble(
     responder: Any,
     checkpointer: BaseCheckpointSaver | None,
     guards: tuple[Any, Any, Any] | None = None,
+    grounding: Any | None = None,
 ) -> CompiledStateGraph:
     """Wire the nodes into the graph (shared by build_graph and diagram)."""
     builder = StateGraph(AgentState)
@@ -106,11 +117,17 @@ def _assemble(
     builder.add_node("retriever", retriever)
     builder.add_node("responder", responder)
     planner_targets = {"retriever": "retriever", "responder": "responder"}
+    # The answer leaves the responder through the grounding check, when there is one.
+    answered = "responder"
+    if grounding is not None:
+        builder.add_node("grounding", grounding)
+        builder.add_edge("responder", "grounding")
+        answered = "grounding"
 
     if guards is None:
         builder.add_edge(START, "planner")
         builder.add_edge("retriever", "responder")
-        builder.add_edge("responder", END)
+        builder.add_edge(answered, END)
     else:
         input_guard, retrieval_guard, output_guard = guards
         builder.add_node("input_guard", input_guard)
@@ -120,7 +137,7 @@ def _assemble(
         builder.add_conditional_edges("input_guard", route_after_input_guard, {"planner": "planner", END: END})
         builder.add_edge("retriever", "retrieval_guard")
         builder.add_edge("retrieval_guard", "responder")
-        builder.add_edge("responder", "output_guard")
+        builder.add_edge(answered, "output_guard")
         builder.add_edge("output_guard", END)
 
     builder.add_conditional_edges("planner", route_after_planner, planner_targets)
@@ -128,13 +145,27 @@ def _assemble(
     return builder.compile(checkpointer=checkpointer)
 
 
-def diagram(guardrails: bool = True) -> str:
+def diagram(guardrails: bool = True, grounding: bool = True) -> str:
     """The graph as Mermaid, without building the LLM, retriever, guardrails or Qdrant connection."""
     def placeholder(state: AgentState) -> dict:
         return {}
 
     guards = (placeholder, placeholder, placeholder) if guardrails else None
-    return _assemble(placeholder, placeholder, placeholder, None, guards).get_graph().draw_mermaid()
+    return _assemble(
+        placeholder, placeholder, placeholder, None, guards, placeholder if grounding else None
+    ).get_graph().draw_mermaid()
+
+
+def _progress_status(node: str, update: dict[str, Any]) -> str | None:
+    """Progress message after a graph node finishes (streamed to the user), or None."""
+    if node == "planner":
+        return "Searching the knowledge base…" if update.get("route") == "technical" else "Writing a reply…"
+    if node == "retriever":
+        count = len(update.get("documents") or [])
+        return f"Found {count} relevant passage{'s' if count != 1 else ''}, writing the answer…" if count else None
+    if node == "responder":
+        return "Checking the answer against its sources…" if update.get("sources") else "Checking the answer…"
+    return None
 
 
 @dataclass
@@ -146,6 +177,8 @@ class AgentResponse:
     thread_id: str = ""
     # What the guardrails did this turn: [{"stage", "validator", "action", "detail"}, ...]
     guardrails: list[dict[str, str]] = field(default_factory=list)
+    # The question as stored after the input guardrails (redacted / blocked placeholder).
+    question: str = ""
 
 
 class RAGAgent:
@@ -179,17 +212,21 @@ class RAGAgent:
             if self.jev is not None
             else None
         )
+        # Conversation memory: persisted to MEMORY_DB_PATH unless a checkpointer is injected.
+        self._owns_checkpointer = checkpointer is None
+        self.checkpointer = checkpointer or build_checkpointer(self.settings.memory_db_path)
         self.graph = build_graph(
             llm,
             self.retriever,
-            checkpointer,
+            self.checkpointer,
             self.settings.agent_history_messages,
             planner_llm=planner_llm,
             planner=planner,
-            # Through Portkey, models vary by config (e.g. Groq Llama): tool calling is the
-            # portable way to get the planner's structured output.
-            structured_method="function_calling" if self.settings.llm_provider == "portkey" else None,
+            # Through Portkey, use a JSON-schema response format: Groq's gpt-oss models don't
+            # support forced tool calls, which LangChain's default method relies on.
+            structured_method="json_schema" if self.settings.llm_provider == "portkey" else None,
             guardrails=guardrails if guardrails is not None else self._build_guardrails(),
+            grounding=self.settings.grounding_check_enabled,
         )
 
     def _build_guardrails(self) -> Any | None:
@@ -204,16 +241,53 @@ class RAGAgent:
             return None
         return build_typesafe_client(self.settings)
 
-    def ask(self, question: str, thread_id: str | None = None) -> AgentResponse:
-        thread_id = thread_id or uuid.uuid4().hex
-        config = {
+    def _config(self, thread_id: str) -> dict[str, Any]:
+        return {
             "configurable": {"thread_id": thread_id},
             "callbacks": self.tracer.langchain_callbacks(),
             "run_name": "rag-agent",
         }
+
+    def ask(self, question: str, thread_id: str | None = None) -> AgentResponse:
+        thread_id = thread_id or uuid.uuid4().hex
         # One Langfuse session per conversation thread.
         with self.tracer.attributes(session_id=thread_id, tags=["agent"]):
-            state = self.graph.invoke({"messages": [HumanMessage(question)]}, config=config)
+            state = self.graph.invoke({"messages": [HumanMessage(question)]}, config=self._config(thread_id))
+        return self._response(state, thread_id, question)
+
+    def stream(self, question: str, thread_id: str | None = None) -> Iterator[dict[str, Any]]:
+        """Run one turn, yielding events as they happen:
+
+        - ``{"type": "status", "text": ...}``: progress ("Searching the knowledge base…");
+        - ``{"type": "token", "text": ...}``: the next piece of the answer as the responder writes it;
+        - ``{"type": "done", "response": AgentResponse}``: last event, the final turn result.
+
+        The output guardrails check the complete answer, so the final ``response.answer`` can
+        differ from the streamed tokens (redacted, citation fixed, or blocked): show it instead.
+        Consume the whole generator in one thread (tracing context is thread-bound).
+        """
+        thread_id = thread_id or uuid.uuid4().hex
+        config = self._config(thread_id)
+        with self.tracer.attributes(session_id=thread_id, tags=["agent", "stream"]):
+            for mode, data in self.graph.stream(
+                {"messages": [HumanMessage(question)]}, config=config, stream_mode=["messages", "updates"]
+            ):
+                if mode == "messages":
+                    chunk, metadata = data
+                    # Only the responder's tokens: the planner/rewriter also call the LLM.
+                    if metadata.get("langgraph_node") == "responder" and isinstance(chunk, AIMessageChunk):
+                        if chunk.text:
+                            yield {"type": "token", "text": chunk.text}
+                else:
+                    for node, update in data.items():
+                        status = _progress_status(node, update or {})
+                        if status:
+                            yield {"type": "status", "text": status}
+            state = self.graph.get_state(config).values
+        yield {"type": "done", "response": self._response(state, thread_id, question)}
+
+    @staticmethod
+    def _response(state: dict[str, Any], thread_id: str, question: str) -> AgentResponse:
         return AgentResponse(
             answer=state["messages"][-1].text,
             route=state.get("route", ""),
@@ -221,13 +295,20 @@ class RAGAgent:
             sources=state.get("sources", []),
             thread_id=thread_id,
             guardrails=state.get("guardrail_events", []),
+            question=next((m.text for m in reversed(state["messages"]) if m.type == "human"), question),
         )
+
+    def forget(self, thread_id: str) -> None:
+        """Delete a conversation's memory (its checkpoints)."""
+        self.checkpointer.delete_thread(thread_id)
 
     def mermaid(self) -> str:
         return self.graph.get_graph().draw_mermaid()
 
     def close(self) -> None:
         self.retriever.close()
+        if self._owns_checkpointer and hasattr(self.checkpointer, "conn"):
+            self.checkpointer.conn.close()
         if self.jev is not None:
             self.jev.close()
         self.tracer.flush()

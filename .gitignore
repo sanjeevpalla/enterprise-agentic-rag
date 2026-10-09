@@ -5,6 +5,7 @@
 logs/
 processed_data/
 qdrant_data/
+memory_data/
 
 # Python
 __pycache__/

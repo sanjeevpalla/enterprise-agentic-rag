@@ -42,6 +42,10 @@ class Settings(BaseSettings):
     # clusters can exceed the client's few-second default.
     qdrant_timeout: int = 60
 
+    # Conversation memory: the agent's per-thread state (LangGraph checkpoints) and the
+    # recent-chats list, in one SQLite file, so conversations survive restarts.
+    memory_db_path: Path = Path("memory_data/memory.sqlite")
+
     # Chunking
     chunk_size: int = 512
     chunk_overlap: int = 64
@@ -52,11 +56,11 @@ class Settings(BaseSettings):
     # PLANNER_MODEL (e.g. a flash-lite model) also spreads the request budget.
     llm_provider: Literal["gemini", "portkey"] = "gemini"
     portkey_api_key: SecretStr | None = None
-    portkey_base_url: str = "https://aigw.portkey.ai/v1"
+    portkey_base_url: str = "https://api.portkey.ai/v1"
     # Optional gateway config: a saved config id ("pc_...") or inline JSON (fallbacks, retries, cache).
     portkey_config: str | None = None
     # Built-in Groq fallback config (used when PORTKEY_CONFIG is empty): Model Catalog
-    # provider slugs (without "@") for llama-3.3-70b-versatile and llama-3.1-8b-instant.
+    # provider slugs (without "@") for openai/gpt-oss-120b and openai/gpt-oss-20b.
     groq_slug: str | None = None
     groq_slug_2: str | None = None  # defaults to GROQ_SLUG
     llm_model: str = "gemini-3.5-flash"
@@ -97,6 +101,8 @@ class Settings(BaseSettings):
 
     # Guardrails (Guardrails AI validators, run locally; see app/guardrails).
     guardrails_enabled: bool = True
+    # Second LLM pass after each technical answer: removes statements its sources don't support.
+    grounding_check_enabled: bool = True
     # Injection-pattern validator on user input and retrieved chunks (fast, rule-based).
     guardrails_injection_patterns: bool = True
     # DetectJailbreak ML model (PyTorch, ~4s load). Off by default: on this project's test

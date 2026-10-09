@@ -17,6 +17,11 @@ DEFAULT_REMOVE_TAGS = (
 )
 
 
+# Heading markers for _split_sections: "\x00<level>\x00<heading text>\x00" (NUL never occurs in HTML text).
+_MARK = "\x00"
+_MARKER = re.compile(r"\n?\x00([1-6])\x00(.*?)\x00\n?")
+
+
 class HTMLLoader(BaseLoader):
     """Load readable text and metadata from ``.html`` / ``.htm`` files.
 
@@ -25,8 +30,10 @@ class HTMLLoader(BaseLoader):
             detect it from the raw bytes (honours ``<meta charset>``).
         parser: BeautifulSoup parser name, e.g. ``"html.parser"`` or ``"lxml"``.
         remove_tags: Tags stripped (with their contents) before text extraction.
-        split_by_headings: If True, return one Document per heading section
-            instead of one Document for the whole page.
+        split_by_headings: If True (default), return one Document per heading section
+            instead of one Document for the whole page. Each records its heading path as
+            ``h1``/``h2``/``h3`` metadata (deeper headings: ``section_heading`` only), which
+            citations show and the splitter prepends to every chunk.
         min_section_length: Sections shorter than this (in characters) are dropped
             when splitting by headings.
     """
@@ -38,7 +45,7 @@ class HTMLLoader(BaseLoader):
         encoding: str | None = None,
         parser: str = "html.parser",
         remove_tags: tuple[str, ...] = DEFAULT_REMOVE_TAGS,
-        split_by_headings: bool = False,
+        split_by_headings: bool = True,
         min_section_length: int = 20,
     ) -> None:
         self.encoding = encoding
@@ -99,29 +106,31 @@ class HTMLLoader(BaseLoader):
             tag.decompose()
 
     def _split_sections(self, body: Tag, base_metadata: dict[str, Any]) -> list[Document]:
-        """Group text under the nearest preceding heading."""
-        sections: list[tuple[str | None, list[str]]] = [(None, [])]
+        """Split the page's full text at its headings (same text as the whole-page mode)."""
+        # Swap each heading for a marker line, so one get_text() keeps all the page's text
+        # (not only <p>/<li>/...) in order, then cut it at the markers.
+        for heading in body.find_all(HEADING_TAGS):
+            text = heading.get_text(separator=" ", strip=True)
+            marker = f"\n{_MARK}{heading.name[1]}{_MARK}{text}{_MARK}\n" if text else "\n"
+            heading.replace_with(marker)
+        pieces = _MARKER.split(body.get_text(separator="\n"))
 
-        for element in body.find_all([*HEADING_TAGS, "p", "li", "pre", "td", "blockquote"]):
-            # Skip nested blocks already covered by an ancestor (e.g. <p> inside <li>).
-            if element.find_parent(["p", "li", "pre", "td", "blockquote"]):
-                continue
-            text = element.get_text(separator=" ", strip=True)
-            if not text:
-                continue
-            if element.name in HEADING_TAGS:
-                sections.append((text, []))
-            else:
-                sections[-1][1].append(text)
+        # pieces = [text before the first heading, level, heading, text, level, heading, text, ...]
+        sections: list[tuple[dict[str, str], str]] = [({}, pieces[0])]
+        path_by_level: dict[int, str] = {}
+        for i in range(1, len(pieces) - 1, 3):
+            level, heading, text = int(pieces[i]), pieces[i + 1], pieces[i + 2]
+            path_by_level = {lvl: t for lvl, t in path_by_level.items() if lvl < level}
+            path_by_level[level] = heading
+            headings = {f"h{lvl}": t for lvl, t in path_by_level.items() if lvl <= 3}
+            sections.append(({**headings, "section_heading": heading}, text))
 
         documents: list[Document] = []
-        for index, (heading, parts) in enumerate(sections):
-            content = self._normalize("\n".join(parts))
+        for index, (headings, text) in enumerate(sections):
+            content = self._normalize(text)
             if len(content) < self.min_section_length:
                 continue
-            if heading:
-                content = f"{heading}\n\n{content}"
-            metadata = {**base_metadata, "section_index": index, "section_heading": heading}
+            metadata = {**base_metadata, **headings, "section_index": index}
             documents.append(Document(page_content=content, metadata=metadata))
         return documents
 

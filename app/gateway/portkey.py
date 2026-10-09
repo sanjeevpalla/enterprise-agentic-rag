@@ -7,7 +7,7 @@ API for every provider, LangChain's ``ChatOpenAI`` is used whatever the underlyi
 
     ChatOpenAI(
         model="@google-prod/gemini-3.5-flash",   # Model Catalog slug: @<provider>/<model>
-        base_url="https://aigw.portkey.ai/v1",
+        base_url="https://api.portkey.ai/v1",
         api_key=PORTKEY_API_KEY,
         default_headers={"x-portkey-config": "pc_..."},  # optional fallbacks/retries/cache
     )

@@ -19,14 +19,17 @@ class DocxLoader(BaseLoader):
     """Load paragraphs and tables from Word documents, in document order.
 
     Args:
-        split_by_headings: If True, return one Document per heading section
-            (based on Word's built-in "Heading N" / "Title" styles).
+        split_by_headings: If True (default), return one Document per heading section
+            (Word's built-in "Title" / "Heading N" styles). Each records its heading path as
+            ``h1``/``h2``/``h3`` metadata (deeper headings: ``section_heading`` only), which
+            citations show and the splitter prepends to every chunk; the heading text isn't
+            repeated in the content.
         include_tables: Include table contents as pipe-separated rows.
     """
 
     supported_extensions = (".docx",)
 
-    def __init__(self, split_by_headings: bool = False, include_tables: bool = True) -> None:
+    def __init__(self, split_by_headings: bool = True, include_tables: bool = True) -> None:
         self.split_by_headings = split_by_headings
         self.include_tables = include_tables
 
@@ -34,14 +37,20 @@ class DocxLoader(BaseLoader):
         document = docx.Document(str(path))
         base_metadata = self._extract_metadata(document, path)
 
-        sections: list[tuple[str | None, list[str]]] = [(None, [])]
+        # (heading metadata, paragraphs) per section; the first holds text before any heading.
+        sections: list[tuple[dict[str, str], list[str]]] = [({}, [])]
+        path_by_level: dict[int, str] = {}
         for block in document.iter_inner_content():
             if isinstance(block, Paragraph):
                 text = block.text.strip()
                 if not text:
                     continue
-                if self.split_by_headings and self._is_heading(block):
-                    sections.append((text, []))
+                level = self._heading_level(block) if self.split_by_headings else None
+                if level is not None:
+                    path_by_level = {lvl: t for lvl, t in path_by_level.items() if lvl < level}
+                    path_by_level[level] = text
+                    headings = {f"h{lvl}": t for lvl, t in path_by_level.items() if lvl <= 3}
+                    sections.append(({**headings, "section_heading": text}, []))
                 else:
                     sections[-1][1].append(text)
             elif isinstance(block, Table) and self.include_tables:
@@ -50,15 +59,13 @@ class DocxLoader(BaseLoader):
                     sections[-1][1].append(table_text)
 
         documents: list[Document] = []
-        for index, (heading, parts) in enumerate(sections):
+        for index, (headings, parts) in enumerate(sections):
             content = "\n\n".join(parts)
-            if heading:
-                content = f"{heading}\n\n{content}".strip()
-            if not content:
+            if not content.strip():
                 continue
             metadata = dict(base_metadata)
             if self.split_by_headings:
-                metadata.update(section_index=index, section_heading=heading)
+                metadata.update(headings, section_index=index)
             documents.append(Document(page_content=content, metadata=metadata))
 
         if not documents:
@@ -66,9 +73,15 @@ class DocxLoader(BaseLoader):
         return documents
 
     @staticmethod
-    def _is_heading(paragraph: Paragraph) -> bool:
+    def _heading_level(paragraph: Paragraph) -> int | None:
+        """1 for "Title", N for "Heading N", None for body text."""
         style = paragraph.style.name if paragraph.style is not None else ""
-        return style.startswith("Heading") or style == "Title"
+        if style == "Title":
+            return 1
+        if style.startswith("Heading"):
+            level = style.removeprefix("Heading").strip()
+            return int(level) if level.isdigit() else 1
+        return None
 
     @staticmethod
     def _table_text(table: Table) -> str:

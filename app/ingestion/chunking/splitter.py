@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -10,11 +11,7 @@ from typing import Iterable, Literal
 
 import tiktoken
 from langchain_core.documents import Document
-from langchain_text_splitters import (
-    MarkdownHeaderTextSplitter,
-    RecursiveCharacterTextSplitter,
-    TextSplitter,
-)
+from langchain_text_splitters import RecursiveCharacterTextSplitter, TextSplitter
 
 # file_type values (set by the loaders) whose content is Markdown.
 MARKDOWN_FILE_TYPES = frozenset({"pdf", "md", "markdown"})
@@ -57,6 +54,16 @@ class BaseSplitter(ABC):
 
     Subclasses implement ``_split`` for a single document. This class handles
     dropping tiny chunks and stamping chunk metadata.
+
+    Every chunk records where it came from, for citations:
+
+    - ``h1``/``h2``/``h3`` (and ``section_heading``): its heading path, when the loader or the
+      Markdown splitter found headings. The path is also prepended to the chunk text as a
+      breadcrumb line (e.g. ``Guide > Install``), so each chunk keeps its context when embedded.
+    - ``start_index``/``end_index``: the chunk's character span in its loaded document's
+      text (one page/slide/sheet/section), and ``body_offset``: where that span starts in the
+      chunk text (after the breadcrumb). The source viewer uses them to join neighbouring
+      chunks exactly.
     """
 
     def __init__(self, config: ChunkingConfig | None = None) -> None:
@@ -66,6 +73,8 @@ class BaseSplitter(ABC):
             if self.config.length_unit == "tokens"
             else None
         )
+        self._header_keys = [key for _, key in self.config.markdown_headers]
+        self._splitter_for_size = lru_cache(maxsize=64)(self._text_splitter)
 
     def split(self, documents: Iterable[Document]) -> list[Document]:
         chunks: list[Document] = []
@@ -96,6 +105,34 @@ class BaseSplitter(ABC):
             length_function=self._length,
         )
 
+    def _breadcrumb(self, metadata: dict) -> str:
+        """``h1 > h2 > h3`` (plus a deeper ``section_heading``), or "" without headings."""
+        path = [metadata[key] for key in self._header_keys if metadata.get(key)]
+        heading = metadata.get("section_heading")
+        if heading and (not path or path[-1] != heading):
+            path.append(heading)
+        return " > ".join(path)
+
+    def _split_section(self, body: str, base_offset: int, metadata: dict) -> list[Document]:
+        """Size-split ``body`` (found at ``base_offset`` in the loaded document's text) into
+        chunks that start with the section's breadcrumb and record their span."""
+        breadcrumb = self._breadcrumb(metadata)
+        prefix = f"{breadcrumb}\n\n" if breadcrumb else ""
+        # Leave room for the breadcrumb, but never squeeze the body below half the budget.
+        budget = max(self.config.chunk_size - self._length(prefix), self.config.chunk_size // 2)
+        chunks: list[Document] = []
+        cursor = 0
+        for text in self._splitter_for_size(budget).split_text(body):
+            # Pieces are verbatim, in order, possibly overlapping: search from the last start.
+            found = body.find(text, cursor)
+            spans: dict = {}
+            if found >= 0:
+                cursor = found + 1
+                start = base_offset + found
+                spans = {"start_index": start, "end_index": start + len(text), "body_offset": len(prefix)}
+            chunks.append(Document(page_content=prefix + text, metadata={**metadata, **spans}))
+        return chunks
+
     @staticmethod
     def _annotate(chunks: list[Document]) -> list[Document]:
         for index, chunk in enumerate(chunks):
@@ -106,14 +143,13 @@ class BaseSplitter(ABC):
 
 
 class RecursiveSplitter(BaseSplitter):
-    """Split on paragraphs, then lines, then words, until chunks fit."""
+    """Split on paragraphs, then lines, then words, until chunks fit.
 
-    def __init__(self, config: ChunkingConfig | None = None) -> None:
-        super().__init__(config)
-        self._splitter = self._text_splitter()
+    Heading metadata set by the loader (Word/HTML sections) becomes each chunk's breadcrumb.
+    """
 
     def _split(self, document: Document) -> list[Document]:
-        return self._splitter.split_documents([document])
+        return self._split_section(document.page_content, 0, dict(document.metadata))
 
 
 class MarkdownSplitter(BaseSplitter):
@@ -121,32 +157,18 @@ class MarkdownSplitter(BaseSplitter):
 
     Chunks never straddle two sections. Each chunk records its heading path in
     metadata (``h1``/``h2``/``h3``) and starts with it as a breadcrumb line
-    (e.g. ``Guide > Install``), so every chunk of a long section keeps its
-    context when embedded. The breadcrumb counts toward ``chunk_size``.
+    (e.g. ``Guide > Install``). The breadcrumb counts toward ``chunk_size``.
+
+    Section text is kept verbatim (indentation, blank lines), and ``#`` lines inside
+    fenced code blocks (shell/YAML comments) are not headings.
     """
 
-    def __init__(self, config: ChunkingConfig | None = None) -> None:
-        super().__init__(config)
-        self._header_keys = [key for _, key in self.config.markdown_headers]
-        self._header_splitter = MarkdownHeaderTextSplitter(
-            headers_to_split_on=list(self.config.markdown_headers),
-            strip_headers=True,
-        )
-        self._splitter_for_size = lru_cache(maxsize=64)(self._text_splitter)
-
     def _split(self, document: Document) -> list[Document]:
+        levels = {marker: key for marker, key in self.config.markdown_headers}
         chunks: list[Document] = []
-        for section in self._header_splitter.split_text(document.page_content):
-            metadata = {**document.metadata, **section.metadata}
-            breadcrumb = " > ".join(
-                metadata[key] for key in self._header_keys if metadata.get(key)
-            )
-            prefix = f"{breadcrumb}\n\n" if breadcrumb else ""
-            # Leave room for the breadcrumb, but never squeeze the body below half the budget.
-            budget = max(self.config.chunk_size - self._length(prefix), self.config.chunk_size // 2)
-            splitter = self._splitter_for_size(budget)
-            for text in splitter.split_text(section.page_content):
-                chunks.append(Document(page_content=prefix + text, metadata=dict(metadata)))
+        for start, end, headings in _markdown_sections(document.page_content, levels):
+            metadata = {**document.metadata, **headings}
+            chunks.extend(self._split_section(document.page_content[start:end], start, metadata))
         return chunks
 
 
@@ -166,6 +188,44 @@ class DocumentSplitter(BaseSplitter):
         if document.metadata.get("file_type") in MARKDOWN_FILE_TYPES:
             return self._markdown._split(document)
         return self._recursive._split(document)
+
+
+_HEADING = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t#]*$")
+_FENCE = re.compile(r"^[ \t]*(`{3,}|~{3,})")
+
+
+def _markdown_sections(text: str, levels: dict[str, str]) -> list[tuple[int, int, dict[str, str]]]:
+    """``(start, end, headings)`` of each section's body in ``text``: the text between one
+    heading line (of a level in ``levels``, e.g. {"#": "h1"}) and the next. Heading lines
+    themselves are excluded; ``#`` lines inside fenced code blocks are ignored."""
+    sections: list[tuple[int, int, dict[str, str]]] = []
+    current: dict[str, str] = {}
+    start = 0
+    fence: str | None = None
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        line_start, offset = offset, offset + len(line)
+        stripped = line.rstrip("\r\n")
+        fence_match = _FENCE.match(stripped)
+        if fence_match:
+            marker = fence_match.group(1)
+            if fence is None:
+                fence = marker[0] * 3
+            elif marker.startswith(fence):
+                fence = None
+            continue
+        heading = None if fence else _HEADING.match(stripped)
+        if not heading or heading.group(1) not in levels:
+            continue
+        sections.append((start, line_start, dict(current)))
+        key = levels[heading.group(1)]
+        depth = list(levels.values()).index(key)
+        # A heading resets its own and deeper levels; "**Bold**" PDF headings lose the markup.
+        current = {k: v for k, v in current.items() if list(levels.values()).index(k) < depth}
+        current[key] = heading.group(2).strip().strip("*_").strip()
+        start = offset
+    sections.append((start, len(text), dict(current)))
+    return [(s, e, h) for s, e, h in sections if text[s:e].strip()]
 
 
 def _chunk_id(chunk: Document) -> str:

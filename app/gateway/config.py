@@ -12,9 +12,10 @@ from typing import Any
 
 from app.config import Settings
 
-# Groq models in fallback order: the 70B model first, the fast 8B model if it fails.
-GROQ_PRIMARY_MODEL = "llama-3.3-70b-versatile"
-GROQ_FALLBACK_MODEL = "llama-3.1-8b-instant"
+# Groq models in fallback order: the 120B model first, the faster 20B model if it fails.
+# (Groq retired the Llama 3.x models these replaced.)
+GROQ_PRIMARY_MODEL = "openai/gpt-oss-120b"
+GROQ_FALLBACK_MODEL = "openai/gpt-oss-20b"
 
 
 def groq_fallback_config(settings: Settings) -> dict[str, Any]:

@@ -72,6 +72,37 @@ LLM_UNAVAILABLE_ANSWER = (
     "Please try again in a minute."
 )
 
+LLM_ERROR_ANSWER = (
+    "Sorry, I couldn't reach the language model because of a configuration problem "
+    "(for example an invalid API key). Please contact the administrator; details are in the server logs."
+)
+
+GROUNDING_SYSTEM = """You verify an assistant's answer against the numbered source passages it \
+was written from. Report only statements that add a SPECIFIC fact the passages neither state nor \
+directly imply: a value, default, limit, name, version, command, behaviour or recommendation \
+that appears nowhere in the passages (even if it is true in general, e.g. a default value the \
+passages never mention), or that contradicts them.
+
+Do NOT report:
+- statements supported by any passage: paraphrases, summaries, and explanations that follow \
+directly from what a passage says (e.g. "retries up to 4 times if it fails" supports "the limit \
+is the number of retries before the Job fails");
+- anything inside code blocks (``` fenced commands, YAML, config);
+- generic guidance with no factual claim ("adjust the value to your needs");
+- statements saying the knowledge base doesn't cover something.
+
+For each unsupported statement, copy the smallest complete sentence (or bullet item) containing \
+it EXACTLY as it appears in the answer, character for character, including any [n] citations. \
+If everything is supported, return an empty list.
+
+Source passages:
+{context}"""
+
+GROUNDING_EMPTY_ANSWER = (
+    "I couldn't find enough support in the knowledge base to answer that reliably. Try rephrasing "
+    "the question or asking about a related topic."
+)
+
 NO_RESULTS_ANSWER = (
     "I couldn't find anything in the knowledge base about that. Try rephrasing the question, "
     "using different terms, or asking about a related topic."
